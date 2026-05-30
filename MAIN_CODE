@@ -1,0 +1,479 @@
+No packages, just copy and paste to Ardunio IDE.
+Note: You must install ardunioFFT library by Enruqie Condes.
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <arduinoFFT.h>
+
+// ---- WiFi ----
+const char* SSID = "RadioScope";
+const char* PASS = "rfdetect";
+
+// ---- FFT Ayarları ----
+#define SAMPLES  256          // Örnekleme sayısı (2'nin kuvveti)
+#define FS       100000       // Örnekleme frekansı (Hz) — ESP8266 ADC donanım maksimumu
+#define BINS     (SAMPLES/2)  // Çıktı bin sayısı: 128
+
+ArduinoFFT<double> FFT = ArduinoFFT<double>();
+double vReal[SAMPLES];
+double vImag[SAMPLES];
+
+// ---- Web Sunucu ----
+ESP8266WebServer server(80);
+
+// ---- Sonuçlar ----
+float mags[BINS];
+float freqs[BINS];
+unsigned long ts = 0;
+
+// ---- Zamanlama ----
+unsigned long lastRead = 0;
+
+// ================================================================
+// FFT
+// ================================================================
+void doFFT() {
+  unsigned long period = 1000000UL / FS;
+
+  // A0'dan oku
+  for (int i = 0; i < SAMPLES; i++) {
+    unsigned long t0 = micros();
+    vReal[i] = analogRead(A0);  // 0–1023
+    vImag[i] = 0;
+    while (micros() - t0 < period);
+  }
+
+  // DC bileşeni kaldır (daha temiz spektrum)
+  double dc = 0;
+  for (int i = 0; i < SAMPLES; i++) dc += vReal[i];
+  dc /= SAMPLES;
+  for (int i = 0; i < SAMPLES; i++) vReal[i] -= dc;
+
+  // Blackman penceresi (zayıf sinyaller için en iyisi)
+  FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_BLACKMAN, FFT_FORWARD);
+  FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  FFT.complexToMagnitude(vReal, vImag, SAMPLES);
+
+  // Sonuçları kaydet
+  for (int i = 0; i < BINS; i++) {
+    freqs[i] = (float)i * FS / SAMPLES;
+    mags[i]  = (i == 0) ? 0 : (float)vReal[i];  // DC bin = 0
+  }
+
+  ts = millis();
+}
+
+// ================================================================
+// HTML
+// ================================================================
+static const char PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RadioScope</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#07090f;color:#c8d8f0;font-family:'Courier New',monospace}
+header{
+  background:#0a1525;border-bottom:2px solid #0f3060;
+  padding:10px 18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px
+}
+.logo{font-size:1.15rem;font-weight:bold;color:#29b6f6;letter-spacing:3px}
+.logo b{color:#80d8ff}
+.hbar{display:flex;gap:18px;flex-wrap:wrap}
+.hi{display:flex;flex-direction:column;align-items:center}
+.hl{font-size:.58rem;color:#37474f;text-transform:uppercase;letter-spacing:1px}
+.hv{font-size:.82rem;font-weight:bold;color:#29b6f6}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#f44336;margin-right:4px}
+.dot.on{background:#00e676;box-shadow:0 0 6px #00e676;animation:bl 1s infinite}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:.3}}
+.wrap{max-width:960px;margin:0 auto;padding:10px;display:flex;flex-direction:column;gap:10px}
+.card{background:#0b1420;border:1px solid #0f2540;border-radius:6px;overflow:hidden}
+.ch{background:#0d1e30;padding:7px 14px;font-size:.65rem;color:#29b6f6;
+    text-transform:uppercase;letter-spacing:2px;border-bottom:1px solid #0f2540;
+    display:flex;justify-content:space-between;align-items:center}
+.tag{background:#061830;border:1px solid #0f3060;padding:2px 8px;border-radius:3px;font-size:.58rem;color:#80d8ff}
+.irow{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;padding:10px}
+.ib{background:#07101a;border:1px solid #0f2540;border-radius:5px;padding:8px 12px}
+.ib .lb{font-size:.58rem;color:#37474f;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
+.ib .vl{font-size:1.05rem;font-weight:bold;color:#29b6f6}
+.ib .un{font-size:.6rem;color:#546e7a;margin-left:2px}
+canvas{display:block;width:100%;background:#040810}
+.ax{height:18px;background:#040810;border-top:1px solid #0f2540}
+.ctrl{display:flex;gap:10px;padding:8px 12px;flex-wrap:wrap;align-items:center;border-top:1px solid #0f2540}
+.ctrl label{font-size:.7rem;color:#546e7a;display:flex;align-items:center;gap:5px}
+input[type=range]{width:80px;accent-color:#29b6f6;cursor:pointer}
+select{background:#07101a;border:1px solid #0f2540;color:#c8d8f0;padding:3px 7px;
+       border-radius:3px;font:inherit;font-size:.7rem}
+.btn{background:#061830;border:1px solid #0f3060;color:#80d8ff;
+     padding:4px 14px;border-radius:3px;cursor:pointer;font:.72rem 'Courier New',monospace;transition:.2s}
+.btn:hover{background:#0f3060}
+.btn.on{background:#0f3060;border-color:#29b6f6}
+.btn.r{background:#1a0608;border-color:#40101a;color:#ff5252}
+.btn.r:hover{background:#30080c}
+/* S-Meter */
+.sm{padding:6px 14px 10px;border-top:1px solid #0f2540}
+.sm-lbl{font-size:.58rem;color:#37474f;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+.sm-bar{height:10px;background:#060c14;border:1px solid #0f2540;border-radius:5px;overflow:hidden}
+.sm-fill{height:100%;width:0;border-radius:5px;
+         background:linear-gradient(90deg,#00e676 0%,#ffeb3b 60%,#f44336 100%);transition:width .4s}
+#tip{position:fixed;pointer-events:none;background:#0a1825ee;border:1px solid #0f3060;
+     padding:5px 10px;border-radius:4px;font-size:.68rem;color:#80d8ff;display:none;z-index:99}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">&#128225; <b>RADIO</b>SCOPE</div>
+  <div class="hbar">
+    <div class="hi"><span class="hl">Durum</span>
+      <span class="hv"><span class="dot" id="led"></span><span id="sts">Bağlanıyor</span></span></div>
+    <div class="hi"><span class="hl">Algılama</span><span class="hv">1N60 + BC547</span></div>
+    <div class="hi"><span class="hl">Örnekleme</span><span class="hv">100 kHz</span></div>
+    <div class="hi"><span class="hl">Bins</span><span class="hv">128 × 391 Hz</span></div>
+    <div class="hi"><span class="hl">Güncelleme</span><span class="hv">0.5 sn</span></div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- Bilgi satırı -->
+  <div class="irow">
+    <div class="ib"><div class="lb">Tepe Frekansı</div><div class="vl" id="pkf">---</div></div>
+    <div class="ib"><div class="lb">Tepe Gücü</div><div class="vl" id="pkm">---</div></div>
+    <div class="ib"><div class="lb">Tahmini SNR</div><div class="vl" id="snr">---<span class="un">dB</span></div></div>
+    <div class="ib"><div class="lb">Frame</div><div class="vl" id="frm">0<span class="un">#</span></div></div>
+    <div class="ib"><div class="lb">Çalışma</div><div class="vl" id="upt">---<span class="un">sn</span></div></div>
+  </div>
+
+  <!-- S-Meter -->
+  <div class="card">
+    <div class="ch">Sinyal Gücü<span class="tag">S-METER</span></div>
+    <div class="sm">
+      <div class="sm-lbl">Anlık Seviye</div>
+      <div class="sm-bar"><div class="sm-fill" id="smf"></div></div>
+    </div>
+  </div>
+
+  <!-- Spektrum -->
+  <div class="card">
+    <div class="ch">Anlık Spektrum<span class="tag">SPECTRUM</span></div>
+    <canvas id="sc" height="220"></canvas>
+    <canvas id="ax" height="18"></canvas>
+    <div class="ctrl">
+      <label>Min:<input type="range" id="lo" min="0" max="2000" step="10" value="0">
+        <span id="loV">0</span></label>
+      <label>Max:<input type="range" id="hi" min="100" max="8000" step="50" value="2000">
+        <span id="hiV">2000</span></label>
+      <button class="btn" id="holdBtn">&#9654; Peak Hold</button>
+      <button class="btn r" id="clrBtn">&#10006; Temizle</button>
+    </div>
+  </div>
+
+  <!-- Waterfall -->
+  <div class="card">
+    <div class="ch">Waterfall — Zaman/Frekans<span class="tag">WATERFALL</span></div>
+    <canvas id="wf"></canvas>
+    <div class="ctrl">
+      <label>Kaydırma Hızı:<input type="range" id="spd" min="1" max="8" step="1" value="3"></label>
+      <label>Palet:
+        <select id="pal">
+          <option value="sdr" selected>SDR Klasik</option>
+          <option value="heat">Isı</option>
+          <option value="plasma">Plasma</option>
+          <option value="grey">Gri</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+</div>
+<div id="tip"></div>
+
+<script>
+const BINS=128, FS=20000, WFH=220;
+let frame=0, hold=false, pk=new Array(BINS).fill(0);
+let CM=[], CF=[];
+
+// Kanvaslar
+const sc=document.getElementById('sc'), sX=sc.getContext('2d');
+const ax=document.getElementById('ax'), aX=ax.getContext('2d');
+const wf=document.getElementById('wf'), wX=wf.getContext('2d');
+let wfImg=null;
+
+function resize(){
+  const W=sc.parentElement.clientWidth||800;
+  sc.width=W; sc.height=220;
+  ax.width=W; ax.height=18;
+  wf.width=W; wf.height=WFH; wf.style.height=WFH+'px';
+  wfImg=wX.createImageData(W,WFH);
+  for(let i=3;i<wfImg.data.length;i+=4) wfImg.data[i]=255;
+}
+
+// --- Palet ---
+function getClr(v,p){
+  v=Math.max(0,Math.min(1,v));
+  if(p==='heat') return lerp(v,[[0,[0,0,0]],[.3,[100,0,0]],[.6,[255,60,0]],[.85,[255,210,0]],[1,[255,255,200]]]);
+  if(p==='plasma') return lerp(v,[[0,[13,8,135]],[.25,[84,2,163]],[.5,[202,71,60]],[.75,[253,179,74]],[1,[240,249,33]]]);
+  if(p==='grey'){const c=v*255|0;return[c,c,c];}
+  return lerp(v,[[0,[0,0,0]],[.1,[0,0,100]],[.22,[0,0,220]],[.38,[0,180,255]],[.52,[0,255,160]],
+                  [.65,[100,255,0]],[.78,[255,255,0]],[.88,[255,80,0]],[.96,[255,0,0]],[1,[255,255,255]]]);
+}
+function lerp(v,s){
+  for(let i=1;i<s.length;i++){
+    if(v<=s[i][0]){
+      const t=(v-s[i-1][0])/(s[i][0]-s[i-1][0]);
+      return s[i-1][1].map((c,k)=>Math.round(c+t*(s[i][1][k]-c)));
+    }
+  }
+  return s[s.length-1][1];
+}
+
+// --- Waterfall ---
+function wfRow(m){
+  if(!wfImg) return;
+  const W=wf.width,H=WFH;
+  const spd=+document.getElementById('spd').value;
+  const lo=+document.getElementById('lo').value;
+  const hi=+document.getElementById('hi').value;
+  const pal=document.getElementById('pal').value;
+  wfImg.data.copyWithin(0,W*4*spd);
+  const bw=Math.floor(W/BINS);
+  for(let s=0;s<spd;s++){
+    const rs=(H-spd+s)*W*4;
+    for(let b=0;b<BINS;b++){
+      const n=Math.max(0,Math.min(1,(m[b]-lo)/(hi-lo)));
+      const [r,g,bl]=getClr(n,pal);
+      for(let px=0;px<bw;px++){
+        const idx=rs+(b*bw+px)*4;
+        wfImg.data[idx]=r;wfImg.data[idx+1]=g;wfImg.data[idx+2]=bl;wfImg.data[idx+3]=255;
+      }
+    }
+  }
+  wX.putImageData(wfImg,0,0);
+}
+
+// --- Spektrum ---
+function drawSpec(m,f){
+  const W=sc.width,H=sc.height;
+  const lo=+document.getElementById('lo').value;
+  const hi=+document.getElementById('hi').value;
+  sX.fillStyle='#040810';sX.fillRect(0,0,W,H);
+
+  // Izgara
+  sX.strokeStyle='#0c1c2c';sX.lineWidth=1;
+  for(let i=0;i<=8;i++){const y=H*i/8;sX.beginPath();sX.moveTo(0,y);sX.lineTo(W,y);sX.stroke();}
+  for(let i=0;i<BINS;i+=16){const x=W*i/BINS;sX.beginPath();sX.moveTo(x,0);sX.lineTo(x,H);sX.stroke();}
+
+  // Etiketler
+  sX.fillStyle='#1a3a55';sX.font='9px Courier New';sX.textAlign='left';
+  for(let i=0;i<=4;i++) sX.fillText(Math.round(hi-i*(hi-lo)/4),2,H*i/4+10);
+
+  // Peak hold
+  if(hold){
+    sX.beginPath();sX.strokeStyle='rgba(255,220,50,.55)';sX.lineWidth=1;
+    pk.forEach((v,i)=>{
+      const x=W*i/BINS,n=Math.max(0,Math.min(1,(v-lo)/(hi-lo)));
+      i?sX.lineTo(x,H-n*H):sX.moveTo(x,H-n*H);
+    });
+    sX.stroke();
+  }
+
+  // Dolgu
+  const g=sX.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'rgba(20,200,255,.95)');
+  g.addColorStop(.45,'rgba(0,120,255,.55)');
+  g.addColorStop(1,'rgba(0,40,100,.08)');
+  sX.beginPath();sX.moveTo(0,H);
+  m.forEach((v,i)=>{
+    const x=W*i/BINS,n=Math.max(0,Math.min(1,(v-lo)/(hi-lo)));
+    sX.lineTo(x,H-n*H);
+  });
+  sX.lineTo(W,H);sX.closePath();sX.fillStyle=g;sX.fill();
+
+  // Çizgi
+  sX.beginPath();sX.strokeStyle='#00d4ff';sX.lineWidth=1.5;
+  m.forEach((v,i)=>{
+    const x=W*i/BINS,n=Math.max(0,Math.min(1,(v-lo)/(hi-lo)));
+    i?sX.lineTo(x,H-n*H):sX.moveTo(x,H-n*H);
+  });
+  sX.stroke();
+
+  // Tepe noktası
+  const pi=m.reduce((mi,v,i)=>v>m[mi]?i:mi,0);
+  const px=W*pi/BINS,pn=Math.max(0,Math.min(1,(m[pi]-lo)/(hi-lo))),py=H-pn*H;
+  sX.beginPath();sX.arc(px,py,5,0,Math.PI*2);sX.fillStyle='#ff1744';sX.fill();
+  sX.fillStyle='#ff6090';sX.font='9px Courier New';sX.textAlign='center';
+  const fl=f[pi];
+  sX.fillText(fl>=1000?(fl/1000).toFixed(2)+'kHz':fl.toFixed(0)+'Hz',px,py-9);
+}
+
+// --- Frekans ekseni ---
+function drawAx(f){
+  const W=ax.width;
+  aX.fillStyle='#040810';aX.fillRect(0,0,W,18);
+  aX.fillStyle='#1a4060';aX.font='9px Courier New';aX.textAlign='center';
+  for(let i=0;i<BINS;i+=16){
+    const x=W*i/BINS,fl=f[i]||(i*FS/2/BINS);
+    aX.fillText(fl>=1000?(fl/1000).toFixed(1)+'k':fl.toFixed(0),x,13);
+  }
+}
+
+// --- Tooltip ---
+sc.addEventListener('mousemove',e=>{
+  const r=sc.getBoundingClientRect();
+  const b=Math.floor((e.clientX-r.left)/r.width*BINS);
+  if(b>=0&&b<BINS&&CF.length){
+    const t=document.getElementById('tip');
+    t.style.cssText=`display:block;left:${e.clientX+12}px;top:${e.clientY-10}px`;
+    const fl=CF[b];
+    t.innerHTML=`&#128225; ${fl>=1000?(fl/1000).toFixed(2)+'kHz':fl.toFixed(0)+'Hz'}<br>Güç: ${CM[b].toFixed(1)}`;
+  }
+});
+sc.addEventListener('mouseleave',()=>document.getElementById('tip').style.display='none');
+
+// --- Slider etiket güncelle ---
+['lo','hi'].forEach(id=>{
+  const el=document.getElementById(id);
+  el.addEventListener('input',()=>document.getElementById(id+'V').textContent=el.value);
+});
+
+// --- Veri çek ---
+async function fetchData(){
+  try{
+    const r=await fetch('/data',{cache:'no-store'});
+    if(!r.ok) throw 0;
+    const d=await r.json();
+    CM=d.magnitudes; CF=d.frequencies;
+
+    // Peak hold güncelle
+    if(hold) CM.forEach((v,i)=>{ if(v>pk[i]) pk[i]=v; });
+
+    // Tepe
+    const pi=CM.reduce((mi,v,i)=>v>CM[mi]?i:mi,0);
+    const pf=CF[pi],pm=CM[pi];
+    const fStr=pf>=1000?(pf/1000).toFixed(3)+' kHz':pf.toFixed(0)+' Hz';
+    document.getElementById('pkf').textContent=fStr;
+    document.getElementById('pkm').textContent=pm.toFixed(1);
+
+    // SNR
+    const srt=[...CM].sort((a,b)=>a-b);
+    const ns=srt.slice(0,40).reduce((a,v)=>a+v,0)/40;
+    document.getElementById('snr').innerHTML=(ns>0?(20*Math.log10(pm/ns)).toFixed(1):0)+'<span class="un">dB</span>';
+
+    // S-Meter
+    const pct=Math.min(100,(pm/+document.getElementById('hi').value)*100);
+    document.getElementById('smf').style.width=pct+'%';
+
+    // Bilgiler
+    document.getElementById('upt').innerHTML=(d.timestamp/1000).toFixed(0)+'<span class="un">sn</span>';
+    frame++;document.getElementById('frm').innerHTML=frame+'<span class="un">#</span>';
+
+    document.getElementById('led').className='dot on';
+    document.getElementById('sts').textContent='Bağlı';
+
+    drawSpec(CM,CF); wfRow(CM); drawAx(CF);
+
+  }catch(e){
+    document.getElementById('led').className='dot';
+    document.getElementById('sts').textContent='Bağlantı Yok';
+  }
+}
+
+// --- Butonlar ---
+document.getElementById('holdBtn').addEventListener('click',function(){
+  hold=!hold;this.classList.toggle('on',hold);
+  this.textContent=hold?'⏹ Peak Hold':'▶ Peak Hold';
+  if(!hold) pk.fill(0);
+});
+document.getElementById('clrBtn').addEventListener('click',()=>{ pk.fill(0);frame=0;resize(); });
+
+// --- Başlat ---
+window.addEventListener('resize',resize);
+resize();
+setInterval(fetchData,500);
+fetchData();
+</script>
+</body>
+</html>
+)HTML";
+
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n[RadioScope] Baslatiyor...");
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(SSID, PASS);
+  Serial.print("[WiFi] IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", [](){
+    server.sendHeader("Cache-Control","no-cache");
+    server.send_P(200,"text/html; charset=utf-8",PAGE);
+  });
+
+  server.on("/data", [](){
+    server.sendHeader("Access-Control-Allow-Origin","*");
+    server.sendHeader("Cache-Control","no-cache");
+
+    String j="{\"timestamp\":";
+    j+=ts;
+    j+=",\"frequencies\":[";
+    for(int i=0;i<BINS;i++){j+=String(freqs[i],1);if(i<BINS-1)j+=",";}
+    j+="],\"magnitudes\":[";
+    for(int i=0;i<BINS;i++){j+=String(mags[i],1);if(i<BINS-1)j+=",";}
+    j+="]}";
+
+    server.send(200,"application/json",j);
+  });
+
+  server.onNotFound([](){
+    server.send(404,"text/plain","Not Found");
+  });
+
+  server.begin();
+  Serial.println("[HTTP] Hazir — http://192.168.4.1");
+}
+
+void loop() {
+  server.handleClient();
+  if(millis()-lastRead >= 500){
+    lastRead=millis();
+    doFFT();
+  }
+}
+
+void doFFT(){
+  // 100kHz için bekleme döngüsü yok — analogRead() zaten ~10µs sürer
+  // Donanım hızında oku (maksimum örnekleme)
+  for(int i=0;i<SAMPLES;i++){
+    vReal[i]=analogRead(A0);
+    vImag[i]=0;
+  }
+
+  // DC sil
+  double dc=0;
+  for(int i=0;i<SAMPLES;i++) dc+=vReal[i];
+  dc/=SAMPLES;
+  for(int i=0;i<SAMPLES;i++) vReal[i]-=dc;
+
+  // Blackman penceresi + FFT
+  FFT.windowing(vReal,SAMPLES,FFT_WIN_TYP_BLACKMAN,FFT_FORWARD);
+  FFT.compute(vReal,vImag,SAMPLES,FFT_FORWARD);
+  FFT.complexToMagnitude(vReal,vImag,SAMPLES);
+
+  // Kaydet
+  for(int i=0;i<BINS;i++){
+    freqs[i]=(float)i*FS/SAMPLES;
+    mags[i]=(i==0)?0:(float)vReal[i];
+  }
+  ts=millis();
+
+  // Tepe bilgisi Serial'a yaz
+  int pi=0;
+  for(int i=1;i<BINS;i++) if(mags[i]>mags[pi]) pi=i;
+  Serial.printf("[FFT] Tepe: %.0f Hz | Guc: %.1f\n",freqs[pi],mags[pi]);
+}
